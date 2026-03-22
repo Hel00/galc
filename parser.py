@@ -360,8 +360,19 @@ class Parser:
         self._expect(TK.EQ)
         if self._at(TK.LBRACE):
             target = self._parse_compound()
+        elif self._peek().kind in _TYPE_START and not self._at(TK.IDENT, TK.LPAREN):
+            target = self._parse_type()
         else:
-            target = self._parse_expr()
+            # Try type first (handles intd, ptr T, etc.), fall back to expr
+            saved = self._pos
+            try:
+                target = self._parse_type()
+                # Only accept if followed by ;
+                if not self._at(TK.SEMI):
+                    raise ParseError("not a type alias", 0, 0)
+            except ParseError:
+                self._pos = saved
+                target = self._parse_expr()
         self._expect(TK.SEMI)
         return AliasDecl(line, col, name, exported, target)
 
@@ -585,7 +596,7 @@ class Parser:
             self._advance()
             return []
         ops = [self._parse_expr()]
-        # Only consume more commas if the next token isn't ) 
+        # Only consume more commas if the next token isn't )
         # (we can't peek two commas deep cleanly; single-operand per list for POC)
         return ops
 

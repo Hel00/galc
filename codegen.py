@@ -223,36 +223,31 @@ class Codegen:
         if t is AsmStmt:         return self._asm_stmt(node)
         raise NotImplementedError(f"_stmt: unhandled {t.__name__}")
 
-    def _compound(self, node: CompoundStmt, hoist_target: Optional[list] = None) -> str:
-        # Collect exported declarations — hoist them before the block
-        hoisted_pre: list[str] = []
-        body_parts:  list[str] = []
-        for s in node.body:
-            exported = getattr(s, "exported", False)
-            if exported and isinstance(s, VarDecl):
-                # Emit declaration outside the block (no keyword change needed —
-                # 'auto' or typed; just strip 'let'/'var', keep the storage)
-                kw = "constexpr " if s.keyword == "const" else ""
-                if s.type_ann is not None:
-                    decl = f"{kw}{self._decl(s.type_ann, s.name)}"
+    def _compound(self, node: CompoundStmt) -> str:
+        exported_vars = [s for s in node.body
+                         if isinstance(s, VarDecl) and s.exported]
+        if exported_vars:
+            pre: list[str] = []
+            body_parts: list[str] = []
+            for s in node.body:
+                if isinstance(s, VarDecl) and s.exported:
+                    kw = "constexpr " if s.keyword == "const" else ""
+                    if s.type_ann is not None:
+                        pre.append(f"{kw}{self._decl(s.type_ann, s.name)};")
+                    elif s.initializer is not None:
+                        init = self._expr(s.initializer)
+                        pre.append(f"{kw}decltype({init}) {s.name};")
+                    else:
+                        pre.append(f"{kw}__INT32_TYPE__ {s.name};")
+                    if s.initializer is not None:
+                        body_parts.append(f"{s.name} = {self._expr(s.initializer)};")
                 else:
-                    decl = f"{kw}auto {s.name}"
-                if s.initializer is not None:
-                    hoisted_pre.append(f"{decl} = {self._expr(s.initializer)};")
-                else:
-                    hoisted_pre.append(f"{decl};")
-                # Inside the block: just assign (no re-declaration)
-                if s.initializer is not None:
-                    body_parts.append(f"{s.name} = {self._expr(s.initializer)};")
-            else:
-                body_parts.append(self._stmt(s))
-
-        inner = "\n".join(body_parts)
-        block = "{\n" + _indent(inner) + "\n}"
-
-        if hoisted_pre:
-            return "\n".join(hoisted_pre) + "\n" + block
-        return block
+                    body_parts.append(self._stmt(s))
+            inner = "\n".join(body_parts)
+            block = "{\n" + _indent(inner) + "\n}"
+            return "\n".join(pre) + "\n" + block
+        inner = "\n".join(self._stmt(s) for s in node.body)
+        return "{\n" + _indent(inner) + "\n}"
 
     def _return(self, node: ReturnStmt) -> str:
         if node.value is None:
@@ -454,18 +449,29 @@ class Codegen:
 
     def _alias_decl(self, node: AliasDecl) -> str:
         if isinstance(node.target, CompoundStmt):
-            # alias myScope = { ... } — emit an anonymous namespace-struct
             lines = [f"struct _gal_scope_{node.name} {{"]
             for s in node.target.body:
                 lines.append(_indent(self._stmt(s)))
             lines.append("};")
             if node.name == "_":
-                # unnamed alias — inject all exported names via using
                 lines.append(f"// unnamed alias — members accessed via _gal_scope_{node.name}::")
             else:
                 lines.append(f"static _gal_scope_{node.name} {node.name};")
             return "\n".join(lines)
-        # expression alias
+        # If the target is a type node (not an expression), emit using alias
+        try:
+            from ast_nodes import (FundamentalType, PointerType, ReferenceType,
+                                   ValueType, ArrayType, TupleType, UnionType,
+                                   ObjectType, EnumType, AutoType, WildcardType,
+                                   VoidType, IdentType)
+            _type_node_types = (FundamentalType, PointerType, ReferenceType,
+                                ValueType, ArrayType, TupleType, UnionType,
+                                ObjectType, EnumType, AutoType, WildcardType,
+                                VoidType, IdentType)
+            if isinstance(node.target, _type_node_types):
+                return f"using {node.name} = {self._type(node.target)};"
+        except Exception:
+            pass
         target = self._expr(node.target)
         return f"auto& {node.name} = {target};"
 
