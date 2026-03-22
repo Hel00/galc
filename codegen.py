@@ -223,9 +223,36 @@ class Codegen:
         if t is AsmStmt:         return self._asm_stmt(node)
         raise NotImplementedError(f"_stmt: unhandled {t.__name__}")
 
-    def _compound(self, node: CompoundStmt) -> str:
-        inner = "\n".join(self._stmt(s) for s in node.body)
-        return "{\n" + _indent(inner) + "\n}"
+    def _compound(self, node: CompoundStmt, hoist_target: Optional[list] = None) -> str:
+        # Collect exported declarations — hoist them before the block
+        hoisted_pre: list[str] = []
+        body_parts:  list[str] = []
+        for s in node.body:
+            exported = getattr(s, "exported", False)
+            if exported and isinstance(s, VarDecl):
+                # Emit declaration outside the block (no keyword change needed —
+                # 'auto' or typed; just strip 'let'/'var', keep the storage)
+                kw = "constexpr " if s.keyword == "const" else ""
+                if s.type_ann is not None:
+                    decl = f"{kw}{self._decl(s.type_ann, s.name)}"
+                else:
+                    decl = f"{kw}auto {s.name}"
+                if s.initializer is not None:
+                    hoisted_pre.append(f"{decl} = {self._expr(s.initializer)};")
+                else:
+                    hoisted_pre.append(f"{decl};")
+                # Inside the block: just assign (no re-declaration)
+                if s.initializer is not None:
+                    body_parts.append(f"{s.name} = {self._expr(s.initializer)};")
+            else:
+                body_parts.append(self._stmt(s))
+
+        inner = "\n".join(body_parts)
+        block = "{\n" + _indent(inner) + "\n}"
+
+        if hoisted_pre:
+            return "\n".join(hoisted_pre) + "\n" + block
+        return block
 
     def _return(self, node: ReturnStmt) -> str:
         if node.value is None:
@@ -445,19 +472,18 @@ class Codegen:
     # ---- import / include -----------------------------------------------
 
     def _import(self, node: ImportDirective) -> str:
-        # For the POC: resolve the file, parse it, emit only exported decls
-        # as forward declarations. A full impl would do proper module tracking.
-        path = self._resolve_path(node.path)
-        if path is None:
+        fpath = self._resolve_path(node.path)
+        if fpath is None:
             return f"// import \"{node.path}\" — file not found"
         try:
-            src = open(path).read()
-            tu2 = parse(lex(src))
+            src2 = open(fpath).read()
+            tu2  = parse(lex(src2))
+            for s in tu2.stmts:
+                self._register(s)
             lines = [f"// import \"{node.path}\""]
             for s in tu2.stmts:
-                fwd = self._forward_decl(s)
-                if fwd:
-                    lines.append(fwd)
+                if isinstance(s, (VarDecl, TypeDecl, FunctionDecl, OperatorOverload)) and getattr(s, "exported", False):
+                    lines.append(self._stmt(s))
             return "\n".join(lines)
         except Exception as e:
             return f"// import \"{node.path}\" failed: {e}"
