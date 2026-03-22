@@ -270,9 +270,7 @@ class Codegen:
         bit_get   = self._pragma_bit_get(node.pragmas)
 
         if node.type_ann is not None:
-            ctype = self._type(node.type_ann)
-            # bitfield handled at field level; here just emit
-            decl  = f"{storage}{volatile_}{align}{deprecated}{export_}{ctype} {node.name}"
+            decl = f"{storage}{volatile_}{align}{deprecated}{export_}{self._decl(node.type_ann, node.name)}"
         else:
             if node.keyword == "const":
                 decl = f"constexpr auto {node.name}"
@@ -352,20 +350,15 @@ class Codegen:
         align      = self._pragma_align(node.pragmas)
 
         if node.type_ann is not None:
-            ctype = self._type(node.type_ann)
+            base = f"{deprecated}{static_}{volatile_}{align}"
+            decl = self._decl(node.type_ann, node.name)
         else:
-            ctype = "auto"
+            base = f"{deprecated}{static_}{volatile_}{align}"
+            decl = f"auto {node.name}"
 
-        # lambda fields become std::function-like; emit as auto for simplicity
-        init = ""
-        if node.initializer is not None:
-            init = f" = {self._expr(node.initializer)}"
-
-        suffix = ""
-        if bit_set is not None:
-            suffix = f" : {bit_set}"
-
-        return f"{deprecated}{static_}{volatile_}{align}{ctype} {node.name}{suffix}{init};"
+        suffix = f" : {bit_set}" if bit_set is not None else ""
+        init   = f" = {self._expr(node.initializer)}" if node.initializer is not None else ""
+        return f"{base}{decl}{suffix}{init};"
 
     def _enum_def(self, name: str, node: EnumType) -> str:
         # GAL enums are tagged unions; each variant holds any value.
@@ -399,7 +392,8 @@ class Codegen:
             storage = ""
 
         ret  = self._type(node.ret_type) if node.ret_type else "void"
-        params = self._param_list(node.params)
+        vg   = {g.name for g in node.generics if g.variadic}
+        params = self._param_list(node.params, vg)
         body   = self._compound(node.body)
         export_link = self._pragma_export_linkage(node.pragmas)
         import_link = self._pragma_import_linkage(node.pragmas)
@@ -416,7 +410,8 @@ class Codegen:
         else:
             prefix = ""
         ret    = self._type(node.ret_type) if node.ret_type else "void"
-        params = self._param_list(node.params)
+        vg     = {g.name for g in node.generics if g.variadic}
+        params = self._param_list(node.params, vg)
         body   = self._compound(node.body)
 
         # `for` overload — special: not a C++ operator
@@ -733,7 +728,11 @@ class Codegen:
                 return f"::{node.name}"
             return f"{self._expr(node.scope)}::{node.name}"
 
-        if t is MemberExpr:    return f"{self._expr(node.obj)}.{node.member}"
+        if t is MemberExpr:
+            if node.member == "len":
+                obj = self._expr(node.obj)
+                return f"(sizeof({obj})/sizeof(({obj})[0]))"
+            return f"{self._expr(node.obj)}.{node.member}"
         if t is ArrowExpr:     return f"{self._expr(node.ptr)}->{node.member}"
 
         if t is SubscriptExpr:
@@ -897,6 +896,13 @@ class Codegen:
     # Types
     # ====================================================================
 
+    def _decl(self, type_node: TypeNode, name: str) -> str:
+        """Emit a full C++ declaration 'type name' with correct array bracket placement."""
+        if isinstance(type_node, ArrayType):
+            suffix = "[]" if type_node.size is None else f"[{self._expr(type_node.size)}]"
+            return self._decl(type_node.element, name + suffix)
+        return f"{self._type(type_node)} {name}"
+
     def _type(self, node: TypeNode) -> str:
         t = type(node)
 
@@ -962,14 +968,30 @@ class Codegen:
     # Parameters / template params
     # ====================================================================
 
-    def _param_list(self, params: List[Param]) -> str:
+    def _param_list(self, params: List[Param],
+                    variadic_generics: Optional[set] = None) -> str:
         parts = []
+        vg = variadic_generics or set()
         for p in params:
             if p.type_ann is not None:
-                ctype = self._type(p.type_ann)
-                # Array params decay to pointers in C++
-                if isinstance(p.type_ann, ArrayType):
-                    ctype = self._type(p.type_ann.element) + "*"
+                ann = p.type_ann
+                # T[_] where T is a variadic generic → T... name
+                if (isinstance(ann, ArrayType) and
+                        isinstance(ann.element, IdentType) and
+                        ann.element.name in vg):
+                    pack = ann.element.name
+                    ctype = "const " if p.keyword == "const" else ""
+                    parts.append(f"{ctype}{pack}... {p.name}")
+                    continue
+                # Array params: use _decl for correct bracket placement
+                # but decay unknown-size arrays to pointer
+                if isinstance(ann, ArrayType):
+                    elem = self._type(ann.element)
+                    ctype = ("const " if p.keyword == "const" else "") + elem + "*"
+                    default = f" = {self._expr(p.default)}" if p.default else ""
+                    parts.append(f"{ctype} {p.name}{default}")
+                    continue
+                ctype = self._type(ann)
             else:
                 ctype = "auto"
             if p.keyword == "const":
